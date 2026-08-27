@@ -1,75 +1,129 @@
-import customtkinter as ctk
-import tkinter as tk
-import threading
-import math
-import time
-import sounddevice as sd
-import scipy.io.wavfile as wav
-import numpy as np
-import threading
-import whisper
+import re
+import os
+import platform
+import shutil
+import subprocess
 import anthropic
 from dotenv import load_dotenv
-import os
-import win32com.client
-import re
+
+# ── Voice OUTPUT (text-to-speech) ───────────────────────────────────────────
+# Windows uses the SAPI voices (Zira/Helena) and needs pywin32 — set SPEECH =
+# True on Windows to turn them on. macOS uses the built-in `say` command
+# instead (handled below), so leave SPEECH = False there.
+SPEECH = False
+
+if SPEECH:
+    import win32com.client
+
+    speaker_english = win32com.client.Dispatch("SAPI.SpVoice")
+    speaker_spanish = win32com.client.Dispatch("SAPI.SpVoice")
+
+    for voice in speaker_english.GetVoices():
+        if "Zira" in voice.GetDescription():
+            speaker_english.Voice = voice
+            break
+
+    for voice in speaker_spanish.GetVoices():
+        if "Helena" in voice.GetDescription():
+            speaker_spanish.Voice = voice
+            break
+
+# Pick the speech engine:
+#   Windows -> SAPI (needs SPEECH=True above)
+#   macOS   -> the built-in `say` command (Mónica for Spanish, Samantha for English)
+#   other   -> just print the reply
+if SPEECH:
+    TTS_BACKEND = "sapi"
+elif platform.system() == "Darwin" and shutil.which("say"):
+    TTS_BACKEND = "say"
+else:
+    TTS_BACKEND = "print"
+
+MAC_VOICE_ES = "Mónica"      # `say -v '?'` lists other options
+MAC_VOICE_EN = "Samantha"
+
+
+# ── Voice INPUT (microphone -> text) ────────────────────────────────────────
+# Works on any OS as long as whisper + sounddevice are installed. If they're
+# missing (or fail to load) MIC stays False, the mic button is disabled, and
+# text input still works.
+try:
+    import numpy as np
+    import sounddevice as sd
+    import scipy.io.wavfile as wav
+    import whisper
+
+    whisper_model = whisper.load_model("base")
+    MIC = True
+except Exception as exc:   # any import/model-load failure just disables the mic
+    MIC = False
+    print(f"Microphone disabled — speech-to-text unavailable ({exc})")
 
 
 load_dotenv()
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-whisper_model = whisper.load_model("base")
-speaker_english = win32com.client.Dispatch("SAPI.SpVoice")
-speaker_spanish = win32com.client.Dispatch("SAPI.SpVoice")
-
-
-for voice in speaker_english.GetVoices():
-    if "Zira" in voice.GetDescription():
-        speaker_english.Voice = voice
-        break
-
-for voice in speaker_spanish.GetVoices():
-    if "Helena" in voice.GetDescription():
-        speaker_spanish.Voice = voice
-        break
 
 
 
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 16000   # whisper's native rate — record here so no resampling is needed
 AUDIO_FILE = "input.wav"
 conversation_history = []
 
 
 
-def record_audio():
-    
-    chunks = []
-    stop_flag = threading.Event()
+class Recorder:
+    """Non-blocking mic recorder for the GUI.
 
-    def callback(indata, frame_count, time_info, status):
-        if not stop_flag.is_set():
-            chunks.append(indata.copy())
+    Call start() to begin capturing, then stop() to finish and write the
+    audio to a wav file. stop() returns the file path, or None if nothing
+    was captured (e.g. the mic was toggled off instantly).
+    """
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
-        input("Press Enter to start recording...")
-        input("Press Enter to stop...")
-        stop_flag.set()
+    def __init__(self, samplerate: int = SAMPLE_RATE):
+        self.samplerate = samplerate
+        self._chunks = []
+        self._stream = None
 
-    try:
-        audio = np.concatenate(chunks, axis=0)
-        wav.write(AUDIO_FILE, SAMPLE_RATE, audio)
-        print("Audio saved.")
-        return AUDIO_FILE
-    except Exception as e:
-        print(f"Error saving audio: {e}")
-        return None
-    
+    def start(self) -> None:
+        self._chunks = []
 
-def transcribe(file_path):
-    result = whisper_model.transcribe(file_path, language="es")
-    transcript = result["text"]
-    return transcript
+        def callback(indata, frame_count, time_info, status):
+            self._chunks.append(indata.copy())
 
-def claude(transcript):
+        self._stream = sd.InputStream(
+            samplerate=self.samplerate, channels=1, callback=callback
+        )
+        self._stream.start()
+
+    def stop(self, file_path: str = AUDIO_FILE):
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+        if not self._chunks:
+            return None
+
+        audio = np.concatenate(self._chunks, axis=0)
+        wav.write(file_path, self.samplerate, audio)
+        return file_path
+
+
+def transcribe(file_path: str) -> str:
+    # Decode the wav ourselves and pass whisper a float32 array, so we don't
+    # need ffmpeg installed (whisper only shells out to ffmpeg for file paths).
+    sr, audio = wav.read(file_path)
+    if np.issubdtype(audio.dtype, np.integer):
+        audio = audio.astype(np.float32) / np.iinfo(audio.dtype).max
+    else:
+        audio = audio.astype(np.float32)
+    if audio.ndim > 1:                     # stereo -> mono
+        audio = audio.mean(axis=1)
+    result = whisper_model.transcribe(audio, language="es")
+    return result["text"]
+
+
+def claude(transcript: str) -> str:
     conversation_history.append({"role": "user", "content": transcript})
 
     response = client.messages.create(
@@ -95,49 +149,54 @@ Rules for each part:
     return reply
 
 
+def strip_speed(full_reply: str):
+    """Pull the leading [SPEED:N] tag off a reply.
+
+    Returns (speed, body) where speed is clamped to -10..0 and body is the
+    reply with the tag removed. [EN]/[ES] tags are left intact for tts().
+    """
+    speed = 0
+    body = full_reply.strip()
+    match = re.match(r'^\[SPEED:(-?\d+)\]', body)
+    if match:
+        speed = max(-10, min(0, int(match.group(1))))
+        body = body[match.end():].strip()
+    return speed, body
+
 
 def tts(reply: str, rate: int = 0):
-    chunks = re.split(r'(\[EN\]|\[ES\])', reply)
-    current_speaker = speaker_spanish  # default to Spanish
-    
-    for chunk in chunks:
+    """Speak (or print) a reply, switching language per [EN]/[ES] tag."""
+    lang = "ES"  # default to Spanish
+    for chunk in re.split(r'(\[EN\]|\[ES\])', reply):
         chunk = chunk.strip()
         if chunk == "[EN]":
-            current_speaker = speaker_english
+            lang = "EN"
         elif chunk == "[ES]":
-            current_speaker = speaker_spanish
+            lang = "ES"
         elif chunk:
-            current_speaker.Rate = rate
-            current_speaker.Speak(chunk)
-
-"""
-
-def main():
-
-    while True:
-        audio_file = record_audio()
-        transcript = transcribe(audio_file)
-        reply = claude(transcript)
-        tts(reply)
-        
-"""
-
-def main():
-    while True:
-        transcript = "hola, cómo estás"
-        reply = claude(transcript)
-        tts(reply)
+            _speak(chunk, lang, rate)
 
 
-if __name__ == "__main__":
-    main()
+def _speak(text: str, lang: str, rate: int) -> None:
+    if TTS_BACKEND == "sapi":
+        speaker = speaker_english if lang == "EN" else speaker_spanish
+        speaker.Rate = rate
+        speaker.Speak(text)
+
+    elif TTS_BACKEND == "say":
+        # Always print the transcript too, so you see and hear the reply.
+        print(("  (correction) " if lang == "EN" else "Tutor › ") + text)
+        voice = MAC_VOICE_EN if lang == "EN" else MAC_VOICE_ES
+        wpm = max(90, 175 + rate * 9)   # rate 0 -> ~175 wpm, negative = slower
+        subprocess.run(["say", "-v", voice, "-r", str(wpm), text])
+
+    else:  # print only
+        print(("  (correction) " if lang == "EN" else "Tutor › ") + text)
 
 
 
 
-
-
-#prompt using eng and esp voices together - doesnt flow very well but works 
+#prompt using eng and esp voices together - doesnt flow very well but works
 """You are an encouraging and patient Spanish tutor having a real conversation with a beginner to intermediate English-speaking student.
 
 You must always respond using exactly this structure, using [EN] and [ES] tags to indicate which language should be spoken aloud:

@@ -3,12 +3,15 @@ import tkinter as tk
 import threading
 import math
 import time
-import re
 import numpy as np
-import pythoncom
 from PIL import Image, ImageTk
 
-from tutor import claude, tts
+try:
+    import pythoncom          # Windows only — needed to use SAPI voices from a thread
+except ImportError:
+    pythoncom = None
+
+from tutor import claude, tts, transcribe, strip_speed, Recorder, MIC
  
 # ── Colour palette ─────────────────────────────────────────────────────────────
 BG          = "#0D0E1A"   # deep navy
@@ -48,13 +51,15 @@ class SpanishTutorApp(ctk.CTk):
         self.resizable(False, False)
         self.configure(fg_color=BG)
  
-        self.app_state = "idle"   # idle | thinking | speaking
+        self.app_state = "idle"   # idle | recording | thinking | speaking
+        self.recorder = Recorder()
         # Precompute pixel distance map for smooth PIL orb rendering
         _s = 320
         _Y, _X = np.ogrid[:_s, :_s]
         self._dist = np.sqrt((_X - _s//2)**2 + (_Y - _s//2)**2).astype(np.float32)
         self._orb_ref = None   # prevent GC of PhotoImage
         self._build_ui()
+        self._set_state("idle")   # sync button states (disables mic in text mode)
         self.after(60, self._animate)
  
     # ── UI build ───────────────────────────────────────────────────────────────
@@ -103,7 +108,21 @@ class SpanishTutorApp(ctk.CTk):
         )
         self.entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.entry.bind("<Return>", lambda e: self._send())
- 
+
+        self.mic_btn = ctk.CTkButton(
+            input_frame,
+            text="🎤",
+            font=ctk.CTkFont("Segoe UI", 18),
+            fg_color=INPUT_BG,
+            hover_color=INPUT_BORD,
+            text_color=WHITE,
+            corner_radius=20,
+            width=40,
+            height=52,
+            command=self._toggle_mic,
+        )
+        self.mic_btn.grid(row=0, column=1, padx=(0, 8))
+
         self.send_btn = ctk.CTkButton(
             input_frame,
             text="➜",
@@ -116,7 +135,7 @@ class SpanishTutorApp(ctk.CTk):
             height=52,
             command=self._send,
         )
-        self.send_btn.grid(row=0, column=1)
+        self.send_btn.grid(row=0, column=2)
  
     # ── Pipeline ───────────────────────────────────────────────────────────────
  
@@ -126,40 +145,73 @@ class SpanishTutorApp(ctk.CTk):
             return
         self.entry.delete(0, "end")
         self._set_state("thinking")
-        threading.Thread(target=self._pipeline, args=(text,), daemon=True).start()
- 
-    def _pipeline(self, text: str):
-        pythoncom.CoInitialize()
+        threading.Thread(target=self._pipeline_text, args=(text,), daemon=True).start()
+
+    def _toggle_mic(self):
+        # First press starts recording, second press stops and responds.
+        if self.app_state == "idle":
+            self.recorder.start()
+            self._set_state("recording")
+        elif self.app_state == "recording":
+            wav_path = self.recorder.stop()
+            if not wav_path:
+                self._set_state("idle")
+                return
+            self._set_state("thinking")
+            threading.Thread(target=self._pipeline_speech, args=(wav_path,), daemon=True).start()
+
+    def _pipeline_text(self, text: str):
+        if pythoncom is not None:
+            pythoncom.CoInitialize()
         try:
-            full_reply = claude(text)
-
-            # Strip [SPEED:N] silently
-            speed = 0
-            speed_match = re.match(r'^\[SPEED:(-?\d+)\]', full_reply.strip())
-            if speed_match:
-                speed = max(-10, min(0, int(speed_match.group(1))))
-                full_reply = full_reply[speed_match.end():].strip()
-
-            self.after(0, lambda: self._set_state("speaking"))
-            tts(full_reply, rate=speed)   # tts() handles [EN]/[ES] tags internally
-            self.after(0, lambda: self._set_state("idle"))
+            self._respond(text)
         except Exception as e:
-            print(f"Pipeline error: {e}")
+            print(f"Text pipeline error: {e}")
             self.after(0, lambda: self._set_state("idle"))
+
+    def _pipeline_speech(self, wav_path: str):
+        if pythoncom is not None:
+            pythoncom.CoInitialize()
+        try:
+            transcript = transcribe(wav_path)
+            self._respond(transcript)
+        except Exception as e:
+            print(f"Speech pipeline error: {e}")
+            self.after(0, lambda: self._set_state("idle"))
+
+    def _respond(self, text: str):
+        """Shared brain — text and speech both land here."""
+        full_reply = claude(text)
+        speed, body = strip_speed(full_reply)   # [EN]/[ES] tags left intact for tts()
+        self.after(0, lambda: self._set_state("speaking"))
+        tts(body, rate=speed)
+        self.after(0, lambda: self._set_state("idle"))
  
     # ── State ──────────────────────────────────────────────────────────────────
  
     def _set_state(self, state: str):
         self.app_state = state
         messages = {
-            "idle":     "¿Qué quieres practicar hoy?",
-            "thinking": "pensando...",
-            "speaking": "hablando...",
+            "idle":      "¿Qué quieres practicar hoy?",
+            "recording": "escuchando...",
+            "thinking":  "pensando...",
+            "speaking":  "hablando...",
         }
         self.status_var.set(messages[state])
         is_idle = state == "idle"
+        is_recording = state == "recording"
+        # Text entry + send are only usable while idle.
         self.send_btn.configure(state="normal" if is_idle else "disabled")
         self.entry.configure(state="normal" if is_idle else "disabled")
+        # Mic is usable while idle (to start) or recording (to stop) — but only
+        # when speech-to-text is available (whisper + sounddevice installed).
+        # Otherwise it stays disabled so nobody clicks a dead mic.
+        mic_enabled = MIC and (is_idle or is_recording)
+        self.mic_btn.configure(
+            state="normal" if mic_enabled else "disabled",
+            text="■" if is_recording else "🎤",
+            fg_color=SEND_COL if is_recording else INPUT_BG,
+        )
  
     # ── Orb renderer ───────────────────────────────────────────────────────────
 
@@ -188,7 +240,7 @@ class SpanishTutorApp(ctk.CTk):
             self._draw_orb_idle(c, cx, cy, t)
         elif self.app_state == "thinking":
             self._draw_orb_thinking(c, cx, cy, t)
-        else:
+        else:  # speaking or recording — both pulse to signal the mic/voice is live
             self._draw_orb_speaking(c, cx, cy, t)
  
         self.after(30, self._animate)
@@ -241,8 +293,6 @@ class SpanishTutorApp(ctk.CTk):
             col = _fade(_blend(GLOW2, GLOW1, (math.sin(angle) + 1) / 2), 0.3 + 0.7 * pulse)
             c.create_oval(x-dot_r, y-dot_r, x+dot_r, y+dot_r, fill=col, outline="")
 
-        c.create_oval(cx-28, cy-34, cx+6, cy-12, fill=_fade(WHITE, 0.10), outline="")
- 
     # -- speaking: ripple waves radiating outward ------------------------------
     def _draw_orb_speaking(self, c, cx, cy, t):
         pulse = 0.5 + 0.5 * math.sin(t * 3.5)
@@ -263,8 +313,6 @@ class SpanishTutorApp(ctk.CTk):
             col = _blend(_fade(GLOW1, alpha), _fade(GLOW2, alpha), 0.5)
             c.create_oval(cx-r, cy-r, cx+r, cy+r, outline=col, width=2, fill="")
 
-        c.create_oval(cx-28, cy-34, cx+6, cy-12, fill=_fade(WHITE, 0.20 + 0.08 * pulse), outline="")
- 
  
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

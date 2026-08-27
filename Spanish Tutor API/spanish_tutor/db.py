@@ -2,18 +2,16 @@ import sqlite3
 import os
 from datetime import datetime
 
-# Always create progress.db next to this file, regardless of working directory
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress.db")
 
-
-def _connect() -> sqlite3.Connection:
+def _connect():
     """Open a connection with foreign key support enabled."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def init_db() -> None:
+def init_db():
     """Create tables if they don't already exist. Safe to call every startup."""
     with _connect() as conn:
         conn.executescript("""
@@ -35,7 +33,7 @@ def init_db() -> None:
         """)
 
 
-def create_session() -> int:
+def create_session():
     """
     Start a new session and return its session_id.
     Call this once at the beginning of each conversation.
@@ -48,7 +46,7 @@ def create_session() -> int:
         return cur.lastrowid
 
 
-def log_correction(session_id: int, turn_number: int, user_input: str, correction: str) -> None:
+def log_correction(session_id: int, turn_number: int, user_input: str, correction: str):
     """
     Store a single correction for a given turn.
     Call this whenever Claude returns a non-empty correction block.
@@ -73,7 +71,7 @@ def log_correction(session_id: int, turn_number: int, user_input: str, correctio
         )
 
 
-def save_summary(session_id: int, summary: str, turns: int) -> None:
+def save_summary(session_id: int, summary: str, turns: int):
     """
     Write the Claude-generated session summary and final turn count.
     Call this when the user ends a session.
@@ -89,7 +87,7 @@ def save_summary(session_id: int, summary: str, turns: int) -> None:
         )
 
 
-def get_session(session_id: int) -> dict | None:
+def get_session(session_id: int):
     """Return a session row as a dict, or None if not found."""
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
@@ -99,7 +97,7 @@ def get_session(session_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-def get_corrections(session_id: int) -> list[dict]:
+def get_corrections(session_id: int):
     """Return all corrections for a session, ordered by turn number."""
     with _connect() as conn:
         conn.row_factory = sqlite3.Row

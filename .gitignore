@@ -1,0 +1,27 @@
+# Secrets — never commit your API key
+.env
+*.env
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Runtime artifacts
+input.wav
+*.wav
+progress.db
+*.db
+
+# Model weights (downloaded at runtime)
+*.pt
+
+# macOS
+.DS_Store
