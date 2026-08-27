@@ -1,0 +1,14 @@
+# Core (all platforms)
+anthropic==1.1.0
+python-dotenv==1.2.3
+customtkinter==6.0.0
+pillow==12.3.0
+numpy==2.5.2
+
+# Speech-to-text — microphone input
+openai-whisper==20250625
+sounddevice==0.5.6
+scipy==1.18.1
+
+# Windows only — SAPI text-to-speech voices (set SPEECH=True in tutor.py)
+pywin32; sys_platform == "win32"
